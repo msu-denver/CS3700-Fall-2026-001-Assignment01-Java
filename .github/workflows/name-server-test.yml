@@ -1,0 +1,110 @@
+name: A0 Java Service Discovery Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Install Pyro5
+      run: |
+        pip install Pyro5==5.17
+
+    - name: Lint with Checkstyle
+      run: |
+        # Download Checkstyle if not already available
+        if [ ! -f checkstyle.jar ]; then
+          curl -L -o checkstyle.jar https://github.com/checkstyle/checkstyle/releases/download/checkstyle-10.12.4/checkstyle-10.12.4-all.jar
+        fi
+        java -jar checkstyle.jar -c /sun_checks.xml src/ || true
+      continue-on-error: true
+
+    - name: Compile Java code
+      run: |
+        javac src/*.java
+
+    - name: Check for JUnit tests
+      id: check_tests
+      run: |
+        if find . -name "*Test.java" -o -name "Test*.java" | grep -q .; then
+          echo "has_tests=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_tests=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Download JaCoCo for coverage
+      run: |
+        if [ ! -f jacocoagent.jar ]; then
+          curl -L -o jacoco.zip https://github.com/jacoco/jacoco/releases/download/v0.8.10/jacoco-0.8.10.zip
+          unzip -q jacoco.zip
+        fi
+
+    - name: Set up JUnit testing with JaCoCo
+      if: steps.check_tests.outputs.has_tests == 'true'
+      run: |
+        # Create a simple test runner if tests exist
+        if [ -d "test" ]; then
+          javac -cp ".:lib/*:$(pwd)/lib/*" test/*Test.java src/*.java 2>/dev/null || true
+        fi
+      continue-on-error: true
+
+    - name: Generate JaCoCo coverage report
+      run: |
+        if [ -f jacocoagent.jar ] && [ -f jacoco.csv ]; then
+          java -jar lib/jacococli.jar report jacoco.exec --classfiles src/ --sourcefiles . --html coverage/ 2>/dev/null || true
+        fi
+      continue-on-error: true
+
+    - name: Upload JaCoCo coverage (if available)
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: java-a0-coverage
+        path: coverage/
+      continue-on-error: true
+
+    - name: Start Pyro5 name server
+      run: |
+        python -m Pyro5.nameserver &
+        sleep 2
+
+    - name: Run service discovery client (grading hook)
+      run: |
+        java -cp src ServiceDiscoveryClient
+      timeout-minutes: 1
+
+    - name: Test output format matches pyro5-nsc
+      run: |
+        output=$(java -cp src ServiceDiscoveryClient)
+        expected=$(python -m Pyro5.nsc list)
+        if [[ "$output" == "$expected" ]]; then
+          echo "✓ Service discovery output matches pyro5-nsc list"
+          exit 0
+        else
+          echo "✗ Service discovery output does not match pyro5-nsc list"
+          echo "Expected:"
+          echo "$expected"
+          echo ""
+          echo "Got:"
+          echo "$output"
+          exit 1
+        fi
+      timeout-minutes: 1
+
+    - name: Clean up
+      if: always()
+      run: |
+        pkill -f "Pyro5.nameserver" || true
